@@ -63,6 +63,18 @@ rm -rf node_modules package-lock.json
 npm install
 ```
 
+### Kung nagfa-flicker ang `Sign in` pagkatapos ng Discord auth
+
+Gamitin ang kasamang updated `index.html`. May dalawang dating problema sa
+lumang frontend: maraming legacy timers ang sabay-sabay nagse-set ng nav label,
+at gumagawa ito ng pangalawang `Sign in with Discord` link. Inalis ng updated
+version ang duplicate link at iisang session state na lang ang ginagamit.
+
+Naayos din sa `server.js` ang session cookie mode. Sa Render, hindi laging
+nakaset ang `NODE_ENV`, kaya awtomatikong gumagamit na ito ng
+`SameSite=None; Secure` kapag HTTPS ang `FRONTEND_URL`. Kailangan eksaktong
+tama ang `FRONTEND_URL` at walang trailing slash.
+
 ## 3. I-wire sa frontend (Netlify/Vercel)
 
 1. Gamitin ang updated `fwy.html` na kasama ng backend package.

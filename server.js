@@ -68,11 +68,15 @@ app.use(cors({
 }));
 
 const COOKIE_NAME = 'fa_session';
-const isProduction = process.env.NODE_ENV === 'production';
+// Render does not always populate NODE_ENV. Since the frontend and backend
+// normally live on different HTTPS domains, derive the cookie mode from the
+// configured frontend URL instead of relying only on NODE_ENV.
+const usesHttpsFrontend = ALLOWED_ORIGINS.some(origin => origin.startsWith('https://'));
+const crossSiteCookie = usesHttpsFrontend || process.env.NODE_ENV === 'production';
 const COOKIE_OPTS = {
   httpOnly: true,
-  secure: isProduction,
-  sameSite: isProduction ? 'none' : 'lax',
+  secure: crossSiteCookie,
+  sameSite: crossSiteCookie ? 'none' : 'lax',
   maxAge: 7 * 24 * 60 * 60 * 1000,
   path: '/',
 };
