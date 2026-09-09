@@ -4,6 +4,7 @@ const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const Database = require('better-sqlite3');
+const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 
@@ -16,6 +17,7 @@ const {
   FRONTEND_URL,
   SESSION_SECRET,
   DB_PATH = './data/fadeaway.sqlite',
+  MEDIA_PATH,
   PORT = 3000,
 } = process.env;
 
@@ -39,6 +41,8 @@ for (const key of REQUIRED_ENV) {
 
 const dbFile = path.resolve(DB_PATH);
 fs.mkdirSync(path.dirname(dbFile), { recursive: true });
+const mediaDir = path.resolve(MEDIA_PATH || path.join(path.dirname(dbFile), 'media'));
+fs.mkdirSync(mediaDir, { recursive: true });
 const db = new Database(dbFile);
 db.pragma('journal_mode = WAL');
 db.exec(`
@@ -199,6 +203,59 @@ function getProfile(id) {
   return db.prepare('SELECT * FROM profiles WHERE id = ?').get(numericId);
 }
 
+const MEDIA_TYPES = {
+  avatar: { maxSize: 12 * 1024 * 1024, allowed: /^image\// },
+  banner: { maxSize: 40 * 1024 * 1024, allowed: /^(image|video)\// },
+  background: { maxSize: 40 * 1024 * 1024, allowed: /^(image|video)\// },
+  music: { maxSize: 12 * 1024 * 1024, allowed: /^audio\// },
+};
+
+function getMediaMeta(row, type) {
+  try {
+    const data = JSON.parse(row?.profile_json || '{}');
+    const media = safeObject(data.media);
+    return safeObject(media[type]);
+  } catch {
+    return {};
+  }
+}
+
+function removeMediaFile(fileName) {
+  if (!fileName) return;
+  const safeName = path.basename(String(fileName));
+  try { fs.unlinkSync(path.join(mediaDir, safeName)); } catch (error) {
+    if (error.code !== 'ENOENT') console.warn('Could not remove old media:', error.message);
+  }
+}
+
+const mediaStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, mediaDir),
+  filename: (req, file, cb) => {
+    const type = String(req.params.type || '');
+    const ext = path.extname(file.originalname || '').toLowerCase().replace(/[^a-z0-9.]/g, '');
+    cb(null, `${req.profileRow.id}-${type}-${Date.now()}${ext}`);
+  },
+});
+
+function mediaUpload(req, res, next) {
+  const config = MEDIA_TYPES[String(req.params.type || '')];
+  if (!config) return res.status(400).json({ error: 'Unsupported media type.' });
+  const upload = multer({
+    storage: mediaStorage,
+    limits: { fileSize: config.maxSize },
+    fileFilter: (_req, file, cb) => cb(null, config.allowed.test(file.mimetype || '')),
+  }).single('file');
+  return upload(req, res, error => {
+    if (error) {
+      if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'That media file is too large.' });
+      }
+      return res.status(400).json({ error: 'Only a supported image, video, or audio file can be uploaded.' });
+    }
+    next();
+  });
+}
+
 function getSessionPayload(req) {
   const token = req.cookies[COOKIE_NAME];
   if (!token) return null;
@@ -340,6 +397,51 @@ app.get('/api/profiles', (req, res) => {
   res.json({ profiles: rows.map(profileFromRow) });
 });
 
+// Public profile media. The profile record stays in SQLite while the binary
+// files live on the configured persistent media path.
+app.get('/api/profiles/:id/media/:type', (req, res) => {
+  const type = String(req.params.type || '');
+  if (!MEDIA_TYPES[type]) return res.status(400).json({ error: 'Unsupported media type.' });
+  const row = getProfile(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Profile not found.' });
+  const meta = getMediaMeta(row, type);
+  if (!meta.fileName) return res.status(404).json({ error: 'Media not found.' });
+  const fileName = path.basename(String(meta.fileName));
+  const filePath = path.join(mediaDir, fileName);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Media not found.' });
+  if (meta.mimeType) res.type(meta.mimeType);
+  return res.sendFile(filePath);
+});
+
+// Only the profile owner can replace their shared avatar/banner/background/music.
+app.put('/api/profiles/:id/media/:type', requireProfileOwner, mediaUpload, (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Choose a supported media file first.' });
+  const type = String(req.params.type || '');
+  const row = req.profileRow;
+  const previous = getMediaMeta(row, type);
+  const now = new Date().toISOString();
+  try {
+    const data = JSON.parse(row.profile_json || '{}');
+    const media = safeObject(data.media);
+    media[type] = {
+      fileName: req.file.filename,
+      mimeType: req.file.mimetype,
+      originalName: cleanText(req.file.originalname, 160),
+      updatedAt: now,
+    };
+    data.media = media;
+    db.prepare('UPDATE profiles SET profile_json = ?, updated_at = ? WHERE id = ?')
+      .run(JSON.stringify(data), now, row.id);
+    removeMediaFile(previous.fileName);
+    const updated = db.prepare('SELECT * FROM profiles WHERE id = ?').get(row.id);
+    return res.json({ media: media[type], profile: profileFromRow(updated) });
+  } catch (error) {
+    removeMediaFile(req.file.filename);
+    console.error(error);
+    return res.status(500).json({ error: 'Could not save profile media.' });
+  }
+});
+
 // Only a verified Discord Founder may create profiles. On an empty database,
 // the first profile is forced to be the currently signed-in Founder.
 app.post('/api/profiles', requireFounder, (req, res) => {
@@ -425,6 +527,8 @@ app.delete('/api/profiles/:id', requireFounder, (req, res) => {
   if (row.role === 'FOUNDER') {
     return res.status(403).json({ error: 'The Founder profile cannot be removed.' });
   }
+  const media = safeObject(JSON.parse(row.profile_json || '{}').media);
+  Object.values(media).forEach(item => removeMediaFile(safeObject(item).fileName));
   db.prepare('DELETE FROM profiles WHERE id = ?').run(row.id);
   res.json({ ok: true });
 });
