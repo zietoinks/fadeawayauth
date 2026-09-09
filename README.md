@@ -76,6 +76,13 @@ nakaset ang `NODE_ENV`, kaya awtomatikong gumagamit na ito ng
 tama ang `FRONTEND_URL`; tinatanggal na rin ng server ang trailing slash
 automatic para hindi ma-reject ng CORS ang frontend.
 
+Hindi kailangan ng Discord bot para sa implementation na ito. OAuth2 ang
+ginagamit, kasama ang `identify` at `guilds.members.read`; ang signed-in user
+ang kailangang nasa guild at may eksaktong Founder role ID. Ang `+ CREATE
+PROFILE` button ay ipinapakita lang kapag ang backend session mismo ay
+nagbalik ng `isFounder: true`, hindi dahil lang may lumang local profile sa
+browser.
+
 ## 3. I-wire sa frontend (Netlify/Vercel)
 
 1. Gamitin ang updated `fwy.html` na kasama ng backend package.
