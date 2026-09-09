@@ -22,6 +22,7 @@ const {
 const ALLOWED_ORIGINS = (FRONTEND_URL || '')
   .split(',')
   .map(s => s.trim())
+  .map(s => s.replace(/\/+$/, ''))
   .filter(Boolean);
 
 const REQUIRED_ENV = [

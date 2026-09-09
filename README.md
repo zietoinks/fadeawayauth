@@ -73,7 +73,8 @@ version ang duplicate link at iisang session state na lang ang ginagamit.
 Naayos din sa `server.js` ang session cookie mode. Sa Render, hindi laging
 nakaset ang `NODE_ENV`, kaya awtomatikong gumagamit na ito ng
 `SameSite=None; Secure` kapag HTTPS ang `FRONTEND_URL`. Kailangan eksaktong
-tama ang `FRONTEND_URL` at walang trailing slash.
+tama ang `FRONTEND_URL`; tinatanggal na rin ng server ang trailing slash
+automatic para hindi ma-reject ng CORS ang frontend.
 
 ## 3. I-wire sa frontend (Netlify/Vercel)
 
