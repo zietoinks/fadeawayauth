@@ -3,6 +3,9 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
+const Database = require('better-sqlite3');
+const fs = require('fs');
+const path = require('path');
 
 const {
   DISCORD_CLIENT_ID,
@@ -12,15 +15,19 @@ const {
   DISCORD_FOUNDER_ROLE_ID,
   FRONTEND_URL,
   SESSION_SECRET,
+  DB_PATH = './data/fadeaway.sqlite',
   PORT = 3000,
 } = process.env;
 
-// Support multiple frontend origins (comma-separated), e.g. custom domain + Netlify preview URL.
-const ALLOWED_ORIGINS = (FRONTEND_URL || '').split(',').map(s => s.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = (FRONTEND_URL || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
 const REQUIRED_ENV = [
   'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'DISCORD_REDIRECT_URI',
-  'DISCORD_GUILD_ID', 'DISCORD_FOUNDER_ROLE_ID', 'FRONTEND_URL', 'SESSION_SECRET',
+  'DISCORD_GUILD_ID', 'DISCORD_FOUNDER_ROLE_ID', 'FRONTEND_URL',
+  'SESSION_SECRET',
 ];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
@@ -29,13 +36,31 @@ for (const key of REQUIRED_ENV) {
   }
 }
 
-const app = express();
-app.set('trust proxy', 1); // Render sits behind a proxy; needed for secure cookies to work.
+const dbFile = path.resolve(DB_PATH);
+fs.mkdirSync(path.dirname(dbFile), { recursive: true });
+const db = new Database(dbFile);
+db.pragma('journal_mode = WAL');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    discord_id TEXT NOT NULL UNIQUE,
+    username TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    handle TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL CHECK (role IN ('FOUNDER', 'OG')),
+    profile_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_profiles_role ON profiles(role);
+`);
 
+const app = express();
+app.set('trust proxy', 1);
 app.use(cookieParser());
+app.use(express.json({ limit: '1mb' }));
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow same-origin/non-browser requests (no Origin header) and any allowed frontend origin.
     if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     cb(new Error('Not allowed by CORS'));
   },
@@ -43,16 +68,144 @@ app.use(cors({
 }));
 
 const COOKIE_NAME = 'fa_session';
+const isProduction = process.env.NODE_ENV === 'production';
 const COOKIE_OPTS = {
   httpOnly: true,
-  secure: true,       // required for SameSite=None; Render serves HTTPS by default.
-  sameSite: 'none',    // frontend (Netlify/Vercel) and backend (Render) are different domains.
-  maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  secure: isProduction,
+  sameSite: isProduction ? 'none' : 'lax',
+  maxAge: 7 * 24 * 60 * 60 * 1000,
   path: '/',
 };
 
+function normalizeDiscordId(value) {
+  let id = String(value || '').trim();
+  const urlMatch = id.match(/discord(?:app)?\.com\/users\/(\d{15,20})/i);
+  if (urlMatch) id = urlMatch[1];
+  return /^\d{15,20}$/.test(id) ? id : '';
+}
+
+function cleanText(value, max) {
+  return String(value ?? '').trim().slice(0, max);
+}
+
+function safeObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function safeLinks(value) {
+  const source = safeObject(value);
+  return ['tiktok', 'spotify', 'youtube', 'steam'].reduce((out, key) => {
+    out[key] = cleanText(source[key], 500);
+    return out;
+  }, {});
+}
+
+function safeLinkHandles(value) {
+  const source = safeObject(value);
+  return ['tiktok', 'spotify', 'youtube', 'steam'].reduce((out, key) => {
+    out[key] = cleanText(source[key], 100);
+    return out;
+  }, {});
+}
+
+function safeGames(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 20).map(game => {
+    if (typeof game === 'string') return { title: cleanText(game, 80) };
+    const source = safeObject(game);
+    const result = { title: cleanText(source.title, 80) };
+    Object.keys(source).slice(0, 12).forEach(key => {
+      if (key !== 'title') result[key] = cleanText(source[key], 160);
+    });
+    return result;
+  }).filter(game => game.title);
+}
+
+function profileFromRow(row) {
+  const data = JSON.parse(row.profile_json || '{}');
+  return {
+    ...data,
+    id: row.id,
+    discordId: row.discord_id,
+    username: row.username,
+    email: `${row.username}@fadeaway.local`,
+    name: row.name,
+    handle: row.handle,
+    role: row.role,
+  };
+}
+
+function profilePayload(body, existing = {}) {
+  const username = cleanText(body.username ?? existing.username, 32)
+    .replace(/^@+/, '');
+  const name = cleanText(body.name ?? existing.name, 64);
+  let handle = cleanText(body.handle ?? existing.handle ?? `@${username}`, 40);
+  if (handle && !handle.startsWith('@')) handle = `@${handle}`;
+  const role = String(body.role ?? existing.role ?? 'OG').toUpperCase() === 'FOUNDER'
+    ? 'FOUNDER' : 'OG';
+  return {
+    username,
+    name,
+    handle,
+    role,
+    discordId: normalizeDiscordId(body.discordId ?? existing.discordId),
+    bio: cleanText(body.bio ?? existing.bio, 240),
+    since: cleanText(body.since ?? existing.since, 10) || new Date().getFullYear().toString(),
+    views: Number.isFinite(Number(existing.views)) ? Number(existing.views) : 0,
+    profileCompleted: true,
+    profileSetupComplete: true,
+    links: safeLinks(body.links ?? existing.links),
+    linkHandles: safeLinkHandles(body.linkHandles ?? existing.linkHandles),
+    games: safeGames(body.games ?? existing.games),
+    specs: safeObject(body.specs ?? existing.specs),
+    musicName: cleanText(body.musicName ?? existing.musicName, 160),
+  };
+}
+
+function insertProfile(profile) {
+  const now = new Date().toISOString();
+  const result = db.prepare(`
+    INSERT INTO profiles
+      (discord_id, username, name, handle, role, profile_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    profile.discordId, profile.username, profile.name, profile.handle,
+    profile.role, JSON.stringify(profile), now, now,
+  );
+  return profileFromRow(db.prepare('SELECT * FROM profiles WHERE id = ?').get(result.lastInsertRowid));
+}
+
+function updateProfile(id, profile) {
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE profiles
+    SET username = ?, name = ?, handle = ?, role = ?, profile_json = ?, updated_at = ?
+    WHERE id = ?
+  `).run(
+    profile.username, profile.name, profile.handle, profile.role,
+    JSON.stringify(profile), now, id,
+  );
+  return profileFromRow(db.prepare('SELECT * FROM profiles WHERE id = ?').get(id));
+}
+
+function getProfile(id) {
+  const numericId = Number(id);
+  if (!Number.isInteger(numericId) || numericId < 1) return null;
+  return db.prepare('SELECT * FROM profiles WHERE id = ?').get(numericId);
+}
+
+function getSessionPayload(req) {
+  const token = req.cookies[COOKIE_NAME];
+  if (!token) return null;
+  try {
+    return jwt.verify(token, SESSION_SECRET);
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Step 1: Kick off Discord OAuth
+// Discord OAuth2
 // ---------------------------------------------------------------------------
 app.get('/auth/discord', (req, res) => {
   const params = new URLSearchParams({
@@ -65,19 +218,12 @@ app.get('/auth/discord', (req, res) => {
   res.redirect(`https://discord.com/api/oauth2/authorize?${params.toString()}`);
 });
 
-// ---------------------------------------------------------------------------
-// Step 2: Discord redirects back here with a ?code=
-// ---------------------------------------------------------------------------
 app.get('/auth/discord/callback', async (req, res) => {
   const { code, error } = req.query;
   const frontend = ALLOWED_ORIGINS[0] || '/';
-
-  if (error || !code) {
-    return res.redirect(`${frontend}?auth=error`);
-  }
+  if (error || !code) return res.redirect(`${frontend}?auth=error`);
 
   try {
-    // Exchange the code for an access token.
     const tokenResp = await fetch('https://discord.com/api/oauth2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -89,7 +235,6 @@ app.get('/auth/discord/callback', async (req, res) => {
         redirect_uri: DISCORD_REDIRECT_URI,
       }),
     });
-
     if (!tokenResp.ok) {
       console.error('Token exchange failed', await tokenResp.text());
       return res.redirect(`${frontend}?auth=error`);
@@ -97,7 +242,6 @@ app.get('/auth/discord/callback', async (req, res) => {
     const tokenData = await tokenResp.json();
     const accessToken = tokenData.access_token;
 
-    // Get basic Discord identity.
     const userResp = await fetch('https://discord.com/api/users/@me', {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
@@ -107,39 +251,28 @@ app.get('/auth/discord/callback', async (req, res) => {
     }
     const discordUser = await userResp.json();
 
-    // Get this user's member object (and roles) for OUR specific guild.
-    // Requires the guilds.members.read scope — no bot token needed.
     const memberResp = await fetch(
       `https://discord.com/api/users/@me/guilds/${DISCORD_GUILD_ID}/member`,
-      { headers: { Authorization: `Bearer ${accessToken}` } }
+      { headers: { Authorization: `Bearer ${accessToken}` } },
     );
-
     let isFounder = false;
     let inGuild = false;
-
     if (memberResp.ok) {
       inGuild = true;
       const member = await memberResp.json();
-      const roles = member.roles || [];
-      isFounder = roles.includes(DISCORD_FOUNDER_ROLE_ID);
-    } else if (memberResp.status === 404) {
-      // User authorized the app but isn't actually a member of the guild.
-      inGuild = false;
-    } else {
+      isFounder = (member.roles || []).includes(DISCORD_FOUNDER_ROLE_ID);
+    } else if (memberResp.status !== 404) {
       console.error('Fetching guild member failed', await memberResp.text());
     }
 
-    const sessionToken = jwt.sign(
-      {
-        discordId: discordUser.id,
-        username: discordUser.username,
-        avatar: discordUser.avatar,
-        inGuild,
-        isFounder,
-      },
-      SESSION_SECRET,
-      { expiresIn: '7d' }
-    );
+    const sessionToken = jwt.sign({
+      discordId: discordUser.id,
+      username: discordUser.username,
+      globalName: discordUser.global_name,
+      avatar: discordUser.avatar,
+      inGuild,
+      isFounder,
+    }, SESSION_SECRET, { expiresIn: '7d' });
 
     res.cookie(COOKIE_NAME, sessionToken, COOKIE_OPTS);
     return res.redirect(`${frontend}?auth=success`);
@@ -149,26 +282,18 @@ app.get('/auth/discord/callback', async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Step 3: Frontend asks "who am I / am I a verified Founder?"
-// ---------------------------------------------------------------------------
 app.get('/api/session', (req, res) => {
-  const token = req.cookies[COOKIE_NAME];
-  if (!token) return res.json({ loggedIn: false });
-
-  try {
-    const payload = jwt.verify(token, SESSION_SECRET);
-    return res.json({
-      loggedIn: true,
-      discordId: payload.discordId,
-      username: payload.username,
-      avatar: payload.avatar,
-      inGuild: payload.inGuild,
-      isFounder: payload.isFounder,
-    });
-  } catch (e) {
-    return res.json({ loggedIn: false });
-  }
+  const payload = getSessionPayload(req);
+  if (!payload) return res.json({ loggedIn: false });
+  return res.json({
+    loggedIn: true,
+    discordId: payload.discordId,
+    username: payload.username,
+    globalName: payload.globalName,
+    avatar: payload.avatar,
+    inGuild: payload.inGuild,
+    isFounder: payload.isFounder,
+  });
 });
 
 app.post('/api/logout', (req, res) => {
@@ -176,34 +301,129 @@ app.post('/api/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------------------------------------------------------------------------
-// Middleware you can reuse to protect any future "create profile" API route.
-// The frontend hiding the button is a UX nicety — THIS is the real enforcement.
-// ---------------------------------------------------------------------------
-function requireFounder(req, res, next) {
-  const token = req.cookies[COOKIE_NAME];
-  if (!token) return res.status(401).json({ error: 'Not signed in with Discord.' });
-  try {
-    const payload = jwt.verify(token, SESSION_SECRET);
-    if (!payload.isFounder) {
-      return res.status(403).json({ error: 'Founder role required.' });
-    }
-    req.discordUser = payload;
-    next();
-  } catch (e) {
-    return res.status(401).json({ error: 'Session expired, please sign in again.' });
-  }
+function requireSession(req, res, next) {
+  const payload = getSessionPayload(req);
+  if (!payload) return res.status(401).json({ error: 'Sign in with Discord first.' });
+  req.discordUser = payload;
+  next();
 }
 
-// Example placeholder — wire your real profile-save logic here later.
-// Currently profiles are stored client-side (localStorage) in fwy.html, so this
-// endpoint isn't called yet, but it shows the pattern for when you move profile
-// storage server-side.
-app.post('/api/profile', requireFounder, express.json(), (req, res) => {
-  // TODO: persist req.body to a real database, keyed by req.discordUser.discordId
-  res.json({ ok: true, discordId: req.discordUser.discordId });
+function requireFounder(req, res, next) {
+  return requireSession(req, res, () => {
+    if (!req.discordUser.isFounder) {
+      return res.status(403).json({ error: 'Founder Discord role required.' });
+    }
+    next();
+  });
+}
+
+function requireProfileOwner(req, res, next) {
+  return requireSession(req, res, () => {
+    const row = getProfile(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Profile not found.' });
+    if (row.discord_id !== req.discordUser.discordId) {
+      return res.status(403).json({ error: 'Only the profile owner can edit this profile.' });
+    }
+    req.profileRow = row;
+    next();
+  });
+}
+
+// Public profile data. Secrets and Discord OAuth tokens are never stored here.
+app.get('/api/profiles', (req, res) => {
+  const rows = db.prepare('SELECT * FROM profiles ORDER BY role = \'FOUNDER\' DESC, id ASC').all();
+  res.json({ profiles: rows.map(profileFromRow) });
 });
 
-app.get('/', (req, res) => res.send('Fadeaway Discord auth backend is running.'));
+// Only a verified Discord Founder may create profiles. On an empty database,
+// the first profile is forced to be the currently signed-in Founder.
+app.post('/api/profiles', requireFounder, (req, res) => {
+  const count = db.prepare('SELECT COUNT(*) AS count FROM profiles').get().count;
+  const profile = profilePayload(req.body || {});
+  if (count === 0) {
+    profile.role = 'FOUNDER';
+    profile.discordId = req.discordUser.discordId;
+  }
+  if (!profile.discordId) {
+    return res.status(400).json({ error: 'A Discord User ID is required so the owner can sign in and edit.' });
+  }
+  if (!profile.username || !/^[a-zA-Z0-9._-]{3,32}$/.test(profile.username)) {
+    return res.status(400).json({ error: 'Username must be 3–32 characters: letters, numbers, dot, dash, or underscore.' });
+  }
+  if (!profile.name) return res.status(400).json({ error: 'Display name is required.' });
+  if (!profile.handle) return res.status(400).json({ error: 'Handle is required.' });
+  if (profile.role === 'FOUNDER' && profile.discordId !== req.discordUser.discordId) {
+    return res.status(403).json({ error: 'A Founder profile must use the Discord ID of the signed-in Founder.' });
+  }
+  try {
+    const created = insertProfile(profile);
+    return res.status(201).json({ profile: created });
+  } catch (err) {
+    if (String(err.code).includes('SQLITE_CONSTRAINT')) {
+      return res.status(409).json({ error: 'That Discord ID, username, or handle is already in use.' });
+    }
+    console.error(err);
+    return res.status(500).json({ error: 'Could not create profile.' });
+  }
+});
 
-app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
+// One-time migration helper for profiles that were previously in localStorage.
+app.post('/api/profiles/import', requireFounder, (req, res) => {
+  const source = Array.isArray(req.body?.profiles) ? req.body.profiles.slice(0, 500) : [];
+  let imported = 0;
+  const insertMany = db.transaction(() => {
+    for (const item of source) {
+      const profile = profilePayload(item || {});
+      if (!profile.discordId || !profile.username || !profile.name) continue;
+      if (profile.role === 'FOUNDER' && profile.discordId !== req.discordUser.discordId) continue;
+      try {
+        insertProfile(profile);
+        imported += 1;
+      } catch (err) {
+        if (!String(err.code).includes('SQLITE_CONSTRAINT')) throw err;
+      }
+    }
+  });
+  try {
+    insertMany();
+    res.json({ ok: true, imported });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not import profiles.' });
+  }
+});
+
+app.put('/api/profiles/:id', requireProfileOwner, (req, res) => {
+  const existing = profileFromRow(req.profileRow);
+  const profile = profilePayload(req.body || {}, existing);
+  profile.username = existing.username;
+  profile.discordId = existing.discordId;
+  profile.role = existing.role;
+  if (!profile.name || !profile.handle) {
+    return res.status(400).json({ error: 'Display name and handle are required.' });
+  }
+  try {
+    const updated = updateProfile(req.profileRow.id, profile);
+    res.json({ profile: updated });
+  } catch (err) {
+    if (String(err.code).includes('SQLITE_CONSTRAINT')) {
+      return res.status(409).json({ error: 'That handle is already in use.' });
+    }
+    console.error(err);
+    res.status(500).json({ error: 'Could not update profile.' });
+  }
+});
+
+app.delete('/api/profiles/:id', requireFounder, (req, res) => {
+  const row = getProfile(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Profile not found.' });
+  if (row.role === 'FOUNDER') {
+    return res.status(403).json({ error: 'The Founder profile cannot be removed.' });
+  }
+  db.prepare('DELETE FROM profiles WHERE id = ?').run(row.id);
+  res.json({ ok: true });
+});
+
+app.get('/', (req, res) => res.send('Fadeaway Discord auth + profile database backend is running.'));
+
+app.listen(PORT, () => console.log(`Listening on port ${PORT}; database: ${dbFile}`));
