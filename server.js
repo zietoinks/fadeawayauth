@@ -26,6 +26,10 @@ const ALLOWED_ORIGINS = (FRONTEND_URL || '')
   .map(s => s.trim())
   .map(s => s.replace(/\/+$/, ''))
   .filter(Boolean);
+const isVercelOrigin = origin =>
+  /^https:\/\/[a-z0-9][a-z0-9-]*\.vercel\.app$/i.test(String(origin || ''));
+const isLocalOrigin = origin =>
+  /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(String(origin || ''));
 
 const REQUIRED_ENV = [
   'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'DISCORD_REDIRECT_URI',
@@ -66,7 +70,9 @@ app.use(cookieParser());
 app.use(express.json({ limit: '1mb' }));
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    if (!origin || ALLOWED_ORIGINS.includes(origin) || isVercelOrigin(origin) || isLocalOrigin(origin)) {
+      return cb(null, true);
+    }
     cb(new Error('Not allowed by CORS'));
   },
   credentials: true,
