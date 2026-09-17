@@ -3,10 +3,8 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
-const Database = require('better-sqlite3');
 const multer = require('multer');
-const fs = require('fs');
-const path = require('path');
+const { MongoClient, ObjectId, GridFSBucket } = require('mongodb');
 
 const {
   DISCORD_CLIENT_ID,
@@ -16,8 +14,8 @@ const {
   DISCORD_FOUNDER_ROLE_ID,
   FRONTEND_URL,
   SESSION_SECRET,
-  DB_PATH = './data/fadeaway.sqlite',
-  MEDIA_PATH,
+  MONGODB_URI,
+  MONGODB_DB = 'fadeaway',
   PORT = 3000,
 } = process.env;
 
@@ -34,7 +32,7 @@ const isLocalOrigin = origin =>
 const REQUIRED_ENV = [
   'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'DISCORD_REDIRECT_URI',
   'DISCORD_GUILD_ID', 'DISCORD_FOUNDER_ROLE_ID', 'FRONTEND_URL',
-  'SESSION_SECRET',
+  'SESSION_SECRET', 'MONGODB_URI',
 ];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
@@ -43,26 +41,38 @@ for (const key of REQUIRED_ENV) {
   }
 }
 
-const dbFile = path.resolve(DB_PATH);
-fs.mkdirSync(path.dirname(dbFile), { recursive: true });
-const mediaDir = path.resolve(MEDIA_PATH || path.join(path.dirname(dbFile), 'media'));
-fs.mkdirSync(mediaDir, { recursive: true });
-const db = new Database(dbFile);
-db.pragma('journal_mode = WAL');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS profiles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    discord_id TEXT NOT NULL UNIQUE,
-    username TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    handle TEXT NOT NULL UNIQUE,
-    role TEXT NOT NULL CHECK (role IN ('FOUNDER', 'OG')),
-    profile_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_profiles_role ON profiles(role);
-`);
+// ---------------------------------------------------------------------------
+// MongoDB Atlas. Profile records live in the `profiles` collection and the
+// binary media lives in GridFS, so nothing depends on the server filesystem.
+// ---------------------------------------------------------------------------
+const mongo = new MongoClient(MONGODB_URI, {
+  maxPoolSize: 10,
+  retryWrites: true,
+});
+
+let profiles;   // collection
+let bucket;     // GridFSBucket
+
+async function connectMongo() {
+  await mongo.connect();
+  const database = mongo.db(MONGODB_DB);
+  profiles = database.collection('profiles');
+  bucket = new GridFSBucket(database, { bucketName: 'media' });
+
+  await Promise.all([
+    profiles.createIndex({ discordId: 1 }, { unique: true }),
+    profiles.createIndex({ username: 1 }, { unique: true }),
+    profiles.createIndex({ handle: 1 }, { unique: true }),
+    profiles.createIndex({ role: 1 }),
+  ]);
+  console.log(`Connected to MongoDB database: ${MONGODB_DB}`);
+}
+
+const isDuplicateKey = err => err && (err.code === 11000 || err.code === 11001);
+
+// Driver v5 wraps findOneAndUpdate results in `{ value }`; v6 returns the
+// document directly. This keeps the code correct on either version.
+const unwrap = result => (result && result.value !== undefined ? result.value : result);
 
 const app = express();
 app.set('trust proxy', 1);
@@ -136,17 +146,15 @@ function safeGames(value) {
   }).filter(game => game.title);
 }
 
-function profileFromRow(row) {
-  const data = JSON.parse(row.profile_json || '{}');
+// The frontend only ever treats `id` as an opaque string, so the Mongo
+// ObjectId is exposed as its hex string and no frontend change is needed.
+function profileFromDoc(doc) {
+  if (!doc) return null;
+  const { _id, createdAt, updatedAt, ...data } = doc;
   return {
     ...data,
-    id: row.id,
-    discordId: row.discord_id,
-    username: row.username,
-    email: `${row.username}@fadeaway.local`,
-    name: row.name,
-    handle: row.handle,
-    role: row.role,
+    id: String(_id),
+    email: `${doc.username}@fadeaway.local`,
   };
 }
 
@@ -177,36 +185,28 @@ function profilePayload(body, existing = {}) {
   };
 }
 
-function insertProfile(profile) {
+async function insertProfile(profile) {
   const now = new Date().toISOString();
-  const result = db.prepare(`
-    INSERT INTO profiles
-      (discord_id, username, name, handle, role, profile_json, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    profile.discordId, profile.username, profile.name, profile.handle,
-    profile.role, JSON.stringify(profile), now, now,
-  );
-  return profileFromRow(db.prepare('SELECT * FROM profiles WHERE id = ?').get(result.lastInsertRowid));
+  const doc = { ...profile, media: {}, createdAt: now, updatedAt: now };
+  const result = await profiles.insertOne(doc);
+  return profileFromDoc({ ...doc, _id: result.insertedId });
 }
 
-function updateProfile(id, profile) {
+// `$set` touches only the payload keys, so the stored media map survives edits.
+async function updateProfile(id, profile) {
   const now = new Date().toISOString();
-  db.prepare(`
-    UPDATE profiles
-    SET username = ?, name = ?, handle = ?, role = ?, profile_json = ?, updated_at = ?
-    WHERE id = ?
-  `).run(
-    profile.username, profile.name, profile.handle, profile.role,
-    JSON.stringify(profile), now, id,
+  const updated = await profiles.findOneAndUpdate(
+    { _id: new ObjectId(id) },
+    { $set: { ...profile, updatedAt: now } },
+    { returnDocument: 'after' },
   );
-  return profileFromRow(db.prepare('SELECT * FROM profiles WHERE id = ?').get(id));
+  return profileFromDoc(unwrap(updated));
 }
 
-function getProfile(id) {
-  const numericId = Number(id);
-  if (!Number.isInteger(numericId) || numericId < 1) return null;
-  return db.prepare('SELECT * FROM profiles WHERE id = ?').get(numericId);
+async function getProfile(id) {
+  const raw = String(id || '');
+  if (!ObjectId.isValid(raw)) return null;
+  return profiles.findOne({ _id: new ObjectId(raw) });
 }
 
 const MEDIA_TYPES = {
@@ -216,32 +216,37 @@ const MEDIA_TYPES = {
   music: { maxSize: 12 * 1024 * 1024, allowed: /^audio\// },
 };
 
-function getMediaMeta(row, type) {
+function getMediaMeta(doc, type) {
+  return safeObject(safeObject(doc?.media)[type]);
+}
+
+async function removeMediaFile(fileId) {
+  if (!fileId || !ObjectId.isValid(String(fileId))) return;
   try {
-    const data = JSON.parse(row?.profile_json || '{}');
-    const media = safeObject(data.media);
-    return safeObject(media[type]);
-  } catch {
-    return {};
+    await bucket.delete(new ObjectId(String(fileId)));
+  } catch (error) {
+    // A missing file is fine; anything else is worth a warning only.
+    if (!/FileNotFound/i.test(String(error && error.message))) {
+      console.warn('Could not remove old media:', error.message);
+    }
   }
 }
 
-function removeMediaFile(fileName) {
-  if (!fileName) return;
-  const safeName = path.basename(String(fileName));
-  try { fs.unlinkSync(path.join(mediaDir, safeName)); } catch (error) {
-    if (error.code !== 'ENOENT') console.warn('Could not remove old media:', error.message);
-  }
+function storeMediaFile(file, profileId, type) {
+  return new Promise((resolve, reject) => {
+    const stream = bucket.openUploadStream(`${profileId}-${type}-${Date.now()}`, {
+      contentType: file.mimetype,
+      metadata: { profileId: String(profileId), type },
+    });
+    stream.on('error', reject);
+    stream.on('finish', () => resolve(stream.id));
+    stream.end(file.buffer);
+  });
 }
 
-const mediaStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, mediaDir),
-  filename: (req, file, cb) => {
-    const type = String(req.params.type || '');
-    const ext = path.extname(file.originalname || '').toLowerCase().replace(/[^a-z0-9.]/g, '');
-    cb(null, `${req.profileRow.id}-${type}-${Date.now()}${ext}`);
-  },
-});
+// Files are buffered in memory and handed straight to GridFS, so the server
+// never writes to its own (ephemeral) disk.
+const mediaStorage = multer.memoryStorage();
 
 function mediaUpload(req, res, next) {
   const config = MEDIA_TYPES[String(req.params.type || '')];
@@ -386,63 +391,85 @@ function requireFounder(req, res, next) {
 }
 
 function requireProfileOwner(req, res, next) {
-  return requireSession(req, res, () => {
-    const row = getProfile(req.params.id);
-    if (!row) return res.status(404).json({ error: 'Profile not found.' });
-    if (row.discord_id !== req.discordUser.discordId) {
-      return res.status(403).json({ error: 'Only the profile owner can edit this profile.' });
+  return requireSession(req, res, async () => {
+    try {
+      const doc = await getProfile(req.params.id);
+      if (!doc) return res.status(404).json({ error: 'Profile not found.' });
+      if (doc.discordId !== req.discordUser.discordId) {
+        return res.status(403).json({ error: 'Only the profile owner can edit this profile.' });
+      }
+      req.profileDoc = doc;
+      next();
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: 'Could not load that profile.' });
     }
-    req.profileRow = row;
-    next();
   });
 }
 
 // Public profile data. Secrets and Discord OAuth tokens are never stored here.
-app.get('/api/profiles', (req, res) => {
-  const rows = db.prepare('SELECT * FROM profiles ORDER BY role = \'FOUNDER\' DESC, id ASC').all();
-  res.json({ profiles: rows.map(profileFromRow) });
+app.get('/api/profiles', async (req, res) => {
+  try {
+    // Founders first, then oldest profile first — same order as before.
+    const docs = await profiles.find({}).sort({ _id: 1 }).toArray();
+    docs.sort((a, b) => (b.role === 'FOUNDER') - (a.role === 'FOUNDER'));
+    res.json({ profiles: docs.map(profileFromDoc) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load profiles.' });
+  }
 });
 
-// Public profile media. The profile record stays in SQLite while the binary
-// files live on the configured persistent media path.
-app.get('/api/profiles/:id/media/:type', (req, res) => {
+// Public profile media, streamed straight out of GridFS.
+app.get('/api/profiles/:id/media/:type', async (req, res) => {
   const type = String(req.params.type || '');
   if (!MEDIA_TYPES[type]) return res.status(400).json({ error: 'Unsupported media type.' });
-  const row = getProfile(req.params.id);
-  if (!row) return res.status(404).json({ error: 'Profile not found.' });
-  const meta = getMediaMeta(row, type);
-  if (!meta.fileName) return res.status(404).json({ error: 'Media not found.' });
-  const fileName = path.basename(String(meta.fileName));
-  const filePath = path.join(mediaDir, fileName);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Media not found.' });
-  if (meta.mimeType) res.type(meta.mimeType);
-  return res.sendFile(filePath);
+  try {
+    const doc = await getProfile(req.params.id);
+    if (!doc) return res.status(404).json({ error: 'Profile not found.' });
+    const meta = getMediaMeta(doc, type);
+    if (!meta.fileId || !ObjectId.isValid(String(meta.fileId))) {
+      return res.status(404).json({ error: 'Media not found.' });
+    }
+    if (meta.mimeType) res.type(meta.mimeType);
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    const stream = bucket.openDownloadStream(new ObjectId(String(meta.fileId)));
+    stream.on('error', () => {
+      if (!res.headersSent) res.status(404).json({ error: 'Media not found.' });
+      else res.end();
+    });
+    stream.pipe(res);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load profile media.' });
+  }
 });
 
 // Only the profile owner can replace their shared avatar/banner/background/music.
-app.put('/api/profiles/:id/media/:type', requireProfileOwner, mediaUpload, (req, res) => {
+app.put('/api/profiles/:id/media/:type', requireProfileOwner, mediaUpload, async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Choose a supported media file first.' });
   const type = String(req.params.type || '');
-  const row = req.profileRow;
-  const previous = getMediaMeta(row, type);
+  const doc = req.profileDoc;
+  const previous = getMediaMeta(doc, type);
   const now = new Date().toISOString();
+  let fileId;
   try {
-    const data = JSON.parse(row.profile_json || '{}');
-    const media = safeObject(data.media);
-    media[type] = {
-      fileName: req.file.filename,
+    fileId = await storeMediaFile(req.file, doc._id, type);
+    const entry = {
+      fileId: String(fileId),
       mimeType: req.file.mimetype,
       originalName: cleanText(req.file.originalname, 160),
       updatedAt: now,
     };
-    data.media = media;
-    db.prepare('UPDATE profiles SET profile_json = ?, updated_at = ? WHERE id = ?')
-      .run(JSON.stringify(data), now, row.id);
-    removeMediaFile(previous.fileName);
-    const updated = db.prepare('SELECT * FROM profiles WHERE id = ?').get(row.id);
-    return res.json({ media: media[type], profile: profileFromRow(updated) });
+    const updated = await profiles.findOneAndUpdate(
+      { _id: doc._id },
+      { $set: { [`media.${type}`]: entry, updatedAt: now } },
+      { returnDocument: 'after' },
+    );
+    await removeMediaFile(previous.fileId);
+    return res.json({ media: entry, profile: profileFromDoc(unwrap(updated)) });
   } catch (error) {
-    removeMediaFile(req.file.filename);
+    await removeMediaFile(fileId);
     console.error(error);
     return res.status(500).json({ error: 'Could not save profile media.' });
   }
@@ -450,29 +477,29 @@ app.put('/api/profiles/:id/media/:type', requireProfileOwner, mediaUpload, (req,
 
 // Only a verified Discord Founder may create profiles. On an empty database,
 // the first profile is forced to be the currently signed-in Founder.
-app.post('/api/profiles', requireFounder, (req, res) => {
-  const count = db.prepare('SELECT COUNT(*) AS count FROM profiles').get().count;
-  const profile = profilePayload(req.body || {});
-  if (count === 0) {
-    profile.role = 'FOUNDER';
-    profile.discordId = req.discordUser.discordId;
-  }
-  if (!profile.discordId) {
-    return res.status(400).json({ error: 'A Discord User ID is required so the owner can sign in and edit.' });
-  }
-  if (!profile.username || !/^[a-zA-Z0-9._-]{3,32}$/.test(profile.username)) {
-    return res.status(400).json({ error: 'Username must be 3–32 characters: letters, numbers, dot, dash, or underscore.' });
-  }
-  if (!profile.name) return res.status(400).json({ error: 'Display name is required.' });
-  if (!profile.handle) return res.status(400).json({ error: 'Handle is required.' });
-  if (profile.role === 'FOUNDER' && profile.discordId !== req.discordUser.discordId) {
-    return res.status(403).json({ error: 'A Founder profile must use the Discord ID of the signed-in Founder.' });
-  }
+app.post('/api/profiles', requireFounder, async (req, res) => {
   try {
-    const created = insertProfile(profile);
+    const count = await profiles.estimatedDocumentCount();
+    const profile = profilePayload(req.body || {});
+    if (count === 0) {
+      profile.role = 'FOUNDER';
+      profile.discordId = req.discordUser.discordId;
+    }
+    if (!profile.discordId) {
+      return res.status(400).json({ error: 'A Discord User ID is required so the owner can sign in and edit.' });
+    }
+    if (!profile.username || !/^[a-zA-Z0-9._-]{3,32}$/.test(profile.username)) {
+      return res.status(400).json({ error: 'Username must be 3–32 characters: letters, numbers, dot, dash, or underscore.' });
+    }
+    if (!profile.name) return res.status(400).json({ error: 'Display name is required.' });
+    if (!profile.handle) return res.status(400).json({ error: 'Handle is required.' });
+    if (profile.role === 'FOUNDER' && profile.discordId !== req.discordUser.discordId) {
+      return res.status(403).json({ error: 'A Founder profile must use the Discord ID of the signed-in Founder.' });
+    }
+    const created = await insertProfile(profile);
     return res.status(201).json({ profile: created });
   } catch (err) {
-    if (String(err.code).includes('SQLITE_CONSTRAINT')) {
+    if (isDuplicateKey(err)) {
       return res.status(409).json({ error: 'That Discord ID, username, or handle is already in use.' });
     }
     console.error(err);
@@ -481,24 +508,21 @@ app.post('/api/profiles', requireFounder, (req, res) => {
 });
 
 // One-time migration helper for profiles that were previously in localStorage.
-app.post('/api/profiles/import', requireFounder, (req, res) => {
+app.post('/api/profiles/import', requireFounder, async (req, res) => {
   const source = Array.isArray(req.body?.profiles) ? req.body.profiles.slice(0, 500) : [];
   let imported = 0;
-  const insertMany = db.transaction(() => {
+  try {
     for (const item of source) {
       const profile = profilePayload(item || {});
       if (!profile.discordId || !profile.username || !profile.name) continue;
       if (profile.role === 'FOUNDER' && profile.discordId !== req.discordUser.discordId) continue;
       try {
-        insertProfile(profile);
+        await insertProfile(profile);
         imported += 1;
       } catch (err) {
-        if (!String(err.code).includes('SQLITE_CONSTRAINT')) throw err;
+        if (!isDuplicateKey(err)) throw err;
       }
     }
-  });
-  try {
-    insertMany();
     res.json({ ok: true, imported });
   } catch (err) {
     console.error(err);
@@ -506,8 +530,8 @@ app.post('/api/profiles/import', requireFounder, (req, res) => {
   }
 });
 
-app.put('/api/profiles/:id', requireProfileOwner, (req, res) => {
-  const existing = profileFromRow(req.profileRow);
+app.put('/api/profiles/:id', requireProfileOwner, async (req, res) => {
+  const existing = profileFromDoc(req.profileDoc);
   const profile = profilePayload(req.body || {}, existing);
   profile.username = existing.username;
   profile.discordId = existing.discordId;
@@ -516,10 +540,10 @@ app.put('/api/profiles/:id', requireProfileOwner, (req, res) => {
     return res.status(400).json({ error: 'Display name and handle are required.' });
   }
   try {
-    const updated = updateProfile(req.profileRow.id, profile);
+    const updated = await updateProfile(req.profileDoc._id, profile);
     res.json({ profile: updated });
   } catch (err) {
-    if (String(err.code).includes('SQLITE_CONSTRAINT')) {
+    if (isDuplicateKey(err)) {
       return res.status(409).json({ error: 'That handle is already in use.' });
     }
     console.error(err);
@@ -527,18 +551,39 @@ app.put('/api/profiles/:id', requireProfileOwner, (req, res) => {
   }
 });
 
-app.delete('/api/profiles/:id', requireFounder, (req, res) => {
-  const row = getProfile(req.params.id);
-  if (!row) return res.status(404).json({ error: 'Profile not found.' });
-  if (row.role === 'FOUNDER') {
-    return res.status(403).json({ error: 'The Founder profile cannot be removed.' });
+app.delete('/api/profiles/:id', requireFounder, async (req, res) => {
+  try {
+    const doc = await getProfile(req.params.id);
+    if (!doc) return res.status(404).json({ error: 'Profile not found.' });
+    if (doc.role === 'FOUNDER') {
+      return res.status(403).json({ error: 'The Founder profile cannot be removed.' });
+    }
+    const media = safeObject(doc.media);
+    for (const item of Object.values(media)) {
+      await removeMediaFile(safeObject(item).fileId);
+    }
+    await profiles.deleteOne({ _id: doc._id });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not delete profile.' });
   }
-  const media = safeObject(JSON.parse(row.profile_json || '{}').media);
-  Object.values(media).forEach(item => removeMediaFile(safeObject(item).fileName));
-  db.prepare('DELETE FROM profiles WHERE id = ?').run(row.id);
-  res.json({ ok: true });
 });
 
 app.get('/', (req, res) => res.send('Fadeaway Discord auth + profile database backend is running.'));
 
-app.listen(PORT, () => console.log(`Listening on port ${PORT}; database: ${dbFile}`));
+// Requests are only accepted once Mongo is reachable, so a cold start never
+// answers with an empty profile list.
+connectMongo()
+  .then(() => {
+    app.listen(PORT, () => console.log(`Listening on port ${PORT}; MongoDB database: ${MONGODB_DB}`));
+  })
+  .catch(err => {
+    console.error('Could not connect to MongoDB:', err.message);
+    process.exit(1);
+  });
+
+process.on('SIGTERM', async () => {
+  await mongo.close().catch(() => {});
+  process.exit(0);
+});
