@@ -407,6 +407,24 @@ function requireProfileOwner(req, res, next) {
   });
 }
 
+function requireOwnerOrFounder(req, res, next) {
+  return requireSession(req, res, async () => {
+    try {
+      const doc = await getProfile(req.params.id);
+      if (!doc) return res.status(404).json({ error: 'Profile not found.' });
+      const isOwner = doc.discordId === req.discordUser.discordId;
+      if (!isOwner && !req.discordUser.isFounder) {
+        return res.status(403).json({ error: 'Only the profile owner or a verified Founder can edit this profile.' });
+      }
+      req.profileDoc = doc;
+      next();
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: 'Could not load that profile.' });
+    }
+  });
+}
+
 // Public profile data. Secrets and Discord OAuth tokens are never stored here.
 app.get('/api/profiles', async (req, res) => {
   try {
@@ -493,9 +511,9 @@ app.post('/api/profiles', requireFounder, async (req, res) => {
     }
     if (!profile.name) return res.status(400).json({ error: 'Display name is required.' });
     if (!profile.handle) return res.status(400).json({ error: 'Handle is required.' });
-    if (profile.role === 'FOUNDER' && profile.discordId !== req.discordUser.discordId) {
-      return res.status(403).json({ error: 'A Founder profile must use the Discord ID of the signed-in Founder.' });
-    }
+    // Any verified Discord Founder may create a profile for someone else and
+    // set their role to FOUNDER — it no longer has to be the signed-in
+    // Founder's own Discord ID.
     const created = await insertProfile(profile);
     return res.status(201).json({ profile: created });
   } catch (err) {
@@ -515,7 +533,6 @@ app.post('/api/profiles/import', requireFounder, async (req, res) => {
     for (const item of source) {
       const profile = profilePayload(item || {});
       if (!profile.discordId || !profile.username || !profile.name) continue;
-      if (profile.role === 'FOUNDER' && profile.discordId !== req.discordUser.discordId) continue;
       try {
         await insertProfile(profile);
         imported += 1;
@@ -530,12 +547,14 @@ app.post('/api/profiles/import', requireFounder, async (req, res) => {
   }
 });
 
-app.put('/api/profiles/:id', requireProfileOwner, async (req, res) => {
+app.put('/api/profiles/:id', requireOwnerOrFounder, async (req, res) => {
   const existing = profileFromDoc(req.profileDoc);
   const profile = profilePayload(req.body || {}, existing);
   profile.username = existing.username;
   profile.discordId = existing.discordId;
-  profile.role = existing.role;
+  // Only a verified Discord Founder may promote/demote a profile's role.
+  // A member editing their own profile can never self-promote.
+  if (!req.discordUser.isFounder) profile.role = existing.role;
   if (!profile.name || !profile.handle) {
     return res.status(400).json({ error: 'Display name and handle are required.' });
   }
