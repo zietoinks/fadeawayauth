@@ -195,9 +195,12 @@ async function insertProfile(profile) {
 // `$set` touches only the payload keys, so the stored media map survives edits.
 async function updateProfile(id, profile) {
   const now = new Date().toISOString();
+  // `views` is only ever changed by the /view endpoint ($inc), so an edit
+  // can never overwrite the live counter with a stale value.
+  const { views: _views, ...editable } = profile;
   const updated = await profiles.findOneAndUpdate(
     { _id: new ObjectId(id) },
-    { $set: { ...profile, updatedAt: now } },
+    { $set: { ...editable, updatedAt: now } },
     { returnDocument: 'after' },
   );
   return profileFromDoc(unwrap(updated));
@@ -435,6 +438,26 @@ app.get('/api/profiles', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not load profiles.' });
+  }
+});
+
+// Public view counter: every profile open adds one view. Atomic $inc, so
+// simultaneous visitors never overwrite each other's count.
+app.post('/api/profiles/:id/view', async (req, res) => {
+  const raw = String(req.params.id || '');
+  if (!ObjectId.isValid(raw)) return res.status(404).json({ error: 'Profile not found.' });
+  try {
+    const updated = await profiles.findOneAndUpdate(
+      { _id: new ObjectId(raw) },
+      { $inc: { views: 1 } },
+      { returnDocument: 'after', projection: { views: 1 } },
+    );
+    const doc = unwrap(updated);
+    if (!doc) return res.status(404).json({ error: 'Profile not found.' });
+    res.json({ views: Number(doc.views) || 0 });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not record the view.' });
   }
 });
 
