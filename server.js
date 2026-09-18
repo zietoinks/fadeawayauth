@@ -597,8 +597,10 @@ app.delete('/api/profiles/:id', requireFounder, async (req, res) => {
   try {
     const doc = await getProfile(req.params.id);
     if (!doc) return res.status(404).json({ error: 'Profile not found.' });
-    if (doc.role === 'FOUNDER') {
-      return res.status(403).json({ error: 'The Founder profile cannot be removed.' });
+    // Any verified Founder may remove any profile, other Founders included.
+    // Only their own profile is protected so they can't delete themselves by accident.
+    if (doc.discordId === req.discordUser.discordId) {
+      return res.status(403).json({ error: 'You cannot remove your own profile.' });
     }
     const media = safeObject(doc.media);
     for (const item of Object.values(media)) {
