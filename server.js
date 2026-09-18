@@ -158,14 +158,23 @@ function profileFromDoc(doc) {
   };
 }
 
+// Roles. Stored keys are kept stable so existing data never has to change:
+//   FOUNDER  - Founders (can manage every profile)
+//   OG_TIER  - the "OG" section shown under Founders
+//   OG       - legacy key for regular FADEAWAY community members ("MEMBER")
+const ROLES = ['FOUNDER', 'OG_TIER', 'OG'];
+const normalizeRole = value => {
+  const role = String(value || '').trim().toUpperCase();
+  return ROLES.includes(role) ? role : 'OG';
+};
+
 function profilePayload(body, existing = {}) {
   const username = cleanText(body.username ?? existing.username, 32)
     .replace(/^@+/, '');
   const name = cleanText(body.name ?? existing.name, 64);
   let handle = cleanText(body.handle ?? existing.handle ?? `@${username}`, 40);
   if (handle && !handle.startsWith('@')) handle = `@${handle}`;
-  const role = String(body.role ?? existing.role ?? 'OG').toUpperCase() === 'FOUNDER'
-    ? 'FOUNDER' : 'OG';
+  const role = normalizeRole(body.role ?? existing.role);
   return {
     username,
     name,
@@ -578,6 +587,8 @@ app.put('/api/profiles/:id', requireOwnerOrFounder, async (req, res) => {
   // Only a verified Discord Founder may promote/demote a profile's role.
   // A member editing their own profile can never self-promote.
   if (!req.discordUser.isFounder) profile.role = existing.role;
+  // Nobody changes their own role, so a Founder can't demote themselves by accident.
+  if (existing.discordId === req.discordUser.discordId) profile.role = existing.role;
   if (!profile.name || !profile.handle) {
     return res.status(400).json({ error: 'Display name and handle are required.' });
   }
