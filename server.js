@@ -168,6 +168,16 @@ const normalizeRole = value => {
   return ROLES.includes(role) ? role : 'OG';
 };
 
+// Settings for the "Enter profile" screen shown before a profile opens.
+function safeEntry(value) {
+  const source = safeObject(value);
+  return {
+    enabled: source.enabled !== false,
+    button: cleanText(source.button, 24),
+    hint: cleanText(source.hint, 60),
+  };
+}
+
 function profilePayload(body, existing = {}) {
   const username = cleanText(body.username ?? existing.username, 32)
     .replace(/^@+/, '');
@@ -191,6 +201,7 @@ function profilePayload(body, existing = {}) {
     games: safeGames(body.games ?? existing.games),
     specs: safeObject(body.specs ?? existing.specs),
     musicName: cleanText(body.musicName ?? existing.musicName, 160),
+    entry: safeEntry(body.entry ?? existing.entry),
   };
 }
 
@@ -629,7 +640,7 @@ app.delete('/api/profiles/:id', requireFounder, async (req, res) => {
 });
 
 // Lets you confirm from a browser which build is really running on the host.
-const SERVER_VERSION = 'og-tier-v2';
+const SERVER_VERSION = 'og-tier-v3-entry';
 app.get('/api/version', (req, res) => res.json({ version: SERVER_VERSION, roles: ROLES }));
 
 app.get('/', (req, res) => res.send(`Fadeaway Discord auth + profile database backend is running. (${SERVER_VERSION})`));
