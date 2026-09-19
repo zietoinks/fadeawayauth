@@ -593,6 +593,9 @@ app.put('/api/profiles/:id', requireOwnerOrFounder, async (req, res) => {
     return res.status(400).json({ error: 'Display name and handle are required.' });
   }
   try {
+    if (profile.role !== existing.role) {
+      console.log(`Role change: ${existing.username} ${existing.role} -> ${profile.role} (by ${req.discordUser.discordId}, founder=${!!req.discordUser.isFounder})`);
+    }
     const updated = await updateProfile(req.profileDoc._id, profile);
     res.json({ profile: updated });
   } catch (err) {
@@ -625,7 +628,11 @@ app.delete('/api/profiles/:id', requireFounder, async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('Fadeaway Discord auth + profile database backend is running.'));
+// Lets you confirm from a browser which build is really running on the host.
+const SERVER_VERSION = 'og-tier-v2';
+app.get('/api/version', (req, res) => res.json({ version: SERVER_VERSION, roles: ROLES }));
+
+app.get('/', (req, res) => res.send(`Fadeaway Discord auth + profile database backend is running. (${SERVER_VERSION})`));
 
 // Requests are only accepted once Mongo is reachable, so a cold start never
 // answers with an empty profile list.
