@@ -233,10 +233,10 @@ async function getProfile(id) {
 }
 
 const MEDIA_TYPES = {
-  avatar: { maxSize: 12 * 1024 * 1024, allowed: /^image\// },
-  banner: { maxSize: 40 * 1024 * 1024, allowed: /^(image|video)\// },
-  background: { maxSize: 40 * 1024 * 1024, allowed: /^(image|video)\// },
-  music: { maxSize: 12 * 1024 * 1024, allowed: /^audio\// },
+  avatar: { maxSize: 2 * 1024 * 1024, allowed: /^image\// },          // 2MB
+  banner: { maxSize: 5 * 1024 * 1024, allowed: /^(image|video)\// },  // 5MB
+  background: { maxSize: 5 * 1024 * 1024, allowed: /^(image|video)\// }, // 5MB
+  music: { maxSize: 6 * 1024 * 1024, allowed: /^audio\// },           // 6MB
 };
 
 function getMediaMeta(doc, type) {
