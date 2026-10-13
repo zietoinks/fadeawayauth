@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const { MongoClient, ObjectId, GridFSBucket } = require('mongodb');
@@ -51,12 +52,14 @@ const mongo = new MongoClient(MONGODB_URI, {
 });
 
 let profiles;   // collection
+let profileViews; // one document per (profile, browser) that has viewed it
 let bucket;     // GridFSBucket
 
 async function connectMongo() {
   await mongo.connect();
   const database = mongo.db(MONGODB_DB);
   profiles = database.collection('profiles');
+  profileViews = database.collection('profileViews');
   bucket = new GridFSBucket(database, { bucketName: 'media' });
 
   await Promise.all([
@@ -64,6 +67,7 @@ async function connectMongo() {
     profiles.createIndex({ username: 1 }, { unique: true }),
     profiles.createIndex({ handle: 1 }, { unique: true }),
     profiles.createIndex({ role: 1 }),
+    profileViews.createIndex({ profileId: 1, visitorId: 1 }, { unique: true }),
   ]);
   console.log(`Connected to MongoDB database: ${MONGODB_DB}`);
 }
@@ -233,10 +237,10 @@ async function getProfile(id) {
 }
 
 const MEDIA_TYPES = {
-  avatar: { maxSize: 2 * 1024 * 1024, allowed: /^image\// },          // 2MB
-  banner: { maxSize: 5 * 1024 * 1024, allowed: /^(image|video)\// },  // 5MB
-  background: { maxSize: 5 * 1024 * 1024, allowed: /^(image|video)\// }, // 5MB
-  music: { maxSize: 6 * 1024 * 1024, allowed: /^audio\// },           // 6MB
+  avatar: { maxSize: 12 * 1024 * 1024, allowed: /^image\// },
+  banner: { maxSize: 40 * 1024 * 1024, allowed: /^(image|video)\// },
+  background: { maxSize: 40 * 1024 * 1024, allowed: /^(image|video)\// },
+  music: { maxSize: 12 * 1024 * 1024, allowed: /^audio\// },
 };
 
 function getMediaMeta(doc, type) {
@@ -303,30 +307,6 @@ function getSessionPayload(req) {
 // ---------------------------------------------------------------------------
 // Discord OAuth2
 // ---------------------------------------------------------------------------
-
-app.get('/api/discord/stats', async (_req, res) => {
-  try {
-    const response = await fetch(`https://discord.com/api/v10/guilds/${process.env.DISCORD_GUILD_ID}?with_counts=true`, {
-      headers: { Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` },
-    });
-
-    if (!response.ok) {
-      return res.status(response.status).json({ error: 'Discord request failed' });
-    }
-
-    const guild = await response.json();
-    res.json({
-      name: guild.name,
-      members: guild.approximate_member_count ?? 0,
-      online: guild.approximate_presence_count ?? 0,
-      invite: process.env.DISCORD_INVITE_URL || '',
-    });
-  } catch (error) {
-    console.error('Discord stats error:', error);
-    res.status(500).json({ error: 'Unable to load Discord stats' });
-  }
-});
-
 app.get('/auth/discord', (req, res) => {
   const params = new URLSearchParams({
     client_id: DISCORD_CLIENT_ID,
@@ -485,20 +465,43 @@ app.get('/api/profiles', async (req, res) => {
   }
 });
 
-// Public view counter: every profile open adds one view. Atomic $inc, so
-// simultaneous visitors never overwrite each other's count.
+// Public view counter: ONE view per browser per profile. Each browser sends a
+// random visitorId (kept in its localStorage). The (profileId, visitorId) pair
+// has a unique index, so the insert only succeeds the first time; only then is
+// the counter incremented. Refreshing or re-opening the profile never adds more.
+function visitorKey(req) {
+  const id = String((req.body && req.body.visitorId) || '');
+  if (/^[A-Za-z0-9_-]{16,64}$/.test(id)) return 'b:' + id;
+  // Fallback for clients that don't send an id: hash of IP + user agent.
+  const raw = `${req.ip || ''}|${req.get('user-agent') || ''}`;
+  return 'h:' + crypto.createHash('sha256').update(raw).digest('hex').slice(0, 32);
+}
+
 app.post('/api/profiles/:id/view', async (req, res) => {
   const raw = String(req.params.id || '');
   if (!ObjectId.isValid(raw)) return res.status(404).json({ error: 'Profile not found.' });
   try {
-    const updated = await profiles.findOneAndUpdate(
-      { _id: new ObjectId(raw) },
-      { $inc: { views: 1 } },
-      { returnDocument: 'after', projection: { views: 1 } },
-    );
-    const doc = unwrap(updated);
+    const _id = new ObjectId(raw);
+    let isNewViewer = false;
+    try {
+      await profileViews.insertOne({ profileId: _id, visitorId: visitorKey(req), at: new Date() });
+      isNewViewer = true;
+    } catch (err) {
+      if (!isDuplicateKey(err)) throw err; // already counted this browser
+    }
+
+    let doc;
+    if (isNewViewer) {
+      doc = unwrap(await profiles.findOneAndUpdate(
+        { _id },
+        { $inc: { views: 1 } },
+        { returnDocument: 'after', projection: { views: 1 } },
+      ));
+    } else {
+      doc = await profiles.findOne({ _id }, { projection: { views: 1 } });
+    }
     if (!doc) return res.status(404).json({ error: 'Profile not found.' });
-    res.json({ views: Number(doc.views) || 0 });
+    res.json({ views: Number(doc.views) || 0, counted: isNewViewer });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not record the view.' });
