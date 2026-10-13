@@ -121,17 +121,36 @@ function safeObject(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
+// Every social the profile editor can send. (Instagram, Twitch and Kick were
+// missing here, so the server silently dropped them on every save.)
+const LINK_KEYS = ['tiktok', 'spotify', 'youtube', 'steam', 'instagram', 'twitch', 'kick'];
+
+// Links are rendered as <a href>, so only real http(s) URLs are kept. A bare
+// "instagram.com/you" gets https:// added (otherwise it opens as a broken
+// relative link) and things like "javascript:..." are discarded.
+function cleanLinkUrl(value) {
+  let url = cleanText(value, 500);
+  if (!url) return '';
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = `https://${url.replace(/^\/+/, '')}`;
+  try {
+    const parsed = new URL(url);
+    return /^https?:$/.test(parsed.protocol) ? parsed.toString() : '';
+  } catch {
+    return '';
+  }
+}
+
 function safeLinks(value) {
   const source = safeObject(value);
-  return ['tiktok', 'spotify', 'youtube', 'steam'].reduce((out, key) => {
-    out[key] = cleanText(source[key], 500);
+  return LINK_KEYS.reduce((out, key) => {
+    out[key] = cleanLinkUrl(source[key]);
     return out;
   }, {});
 }
 
 function safeLinkHandles(value) {
   const source = safeObject(value);
-  return ['tiktok', 'spotify', 'youtube', 'steam'].reduce((out, key) => {
+  return LINK_KEYS.reduce((out, key) => {
     out[key] = cleanText(source[key], 100);
     return out;
   }, {});
@@ -236,11 +255,12 @@ async function getProfile(id) {
   return profiles.findOne({ _id: new ObjectId(raw) });
 }
 
+const MB = 1024 * 1024;
 const MEDIA_TYPES = {
-  avatar: { maxSize: 12 * 1024 * 1024, allowed: /^image\// },
-  banner: { maxSize: 40 * 1024 * 1024, allowed: /^(image|video)\// },
-  background: { maxSize: 40 * 1024 * 1024, allowed: /^(image|video)\// },
-  music: { maxSize: 12 * 1024 * 1024, allowed: /^audio\// },
+  avatar: { maxSize: 1 * MB, allowed: /^image\// },
+  banner: { maxSize: 3 * MB, allowed: /^(image|video)\// },
+  background: { maxSize: 3 * MB, allowed: /^(image|video)\// },
+  music: { maxSize: 3 * MB, allowed: /^audio\// },
 };
 
 function getMediaMeta(doc, type) {
@@ -286,7 +306,7 @@ function mediaUpload(req, res, next) {
   return upload(req, res, error => {
     if (error) {
       if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({ error: 'That media file is too large.' });
+        return res.status(413).json({ error: `That file is too large. Max is ${Math.round(config.maxSize / MB)} MB.` });
       }
       return res.status(400).json({ error: 'Only a supported image, video, or audio file can be uploaded.' });
     }
