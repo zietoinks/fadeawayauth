@@ -303,6 +303,30 @@ function getSessionPayload(req) {
 // ---------------------------------------------------------------------------
 // Discord OAuth2
 // ---------------------------------------------------------------------------
+
+app.get('/api/discord/stats', async (_req, res) => {
+  try {
+    const response = await fetch(`https://discord.com/api/v10/guilds/${process.env.DISCORD_GUILD_ID}?with_counts=true`, {
+      headers: { Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` },
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: 'Discord request failed' });
+    }
+
+    const guild = await response.json();
+    res.json({
+      name: guild.name,
+      members: guild.approximate_member_count ?? 0,
+      online: guild.approximate_presence_count ?? 0,
+      invite: process.env.DISCORD_INVITE_URL || '',
+    });
+  } catch (error) {
+    console.error('Discord stats error:', error);
+    res.status(500).json({ error: 'Unable to load Discord stats' });
+  }
+});
+
 app.get('/auth/discord', (req, res) => {
   const params = new URLSearchParams({
     client_id: DISCORD_CLIENT_ID,
